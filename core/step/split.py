@@ -326,6 +326,8 @@ class SplitStep(BaseStep):
         self.typing = TypingController()
 
     async def handle(self, ctx: OutContext) -> StepResult:
+        # Do not reuse a previous result snapshot if an event is recycled.
+        ctx.event.set_extra("_outputpro_split_full_reply", None)
         # 限制平台
         platform = ctx.event.get_platform_name()
         if platform not in self.support_platforms:
@@ -357,6 +359,9 @@ class SplitStep(BaseStep):
 
         logger.debug(f"[Splitter] 消息被分为 {len(segments)} 段")
 
+        # Track delivered segments for downstream conversation-history hooks.
+        sent_text_parts = []
+
         # 逐段发送
         for i, seg in enumerate(segments[:-1]):
             if seg.is_empty:
@@ -366,6 +371,8 @@ class SplitStep(BaseStep):
                     ctx.event.unified_msg_origin,
                     MessageChain(seg.components),
                 )
+                if ctx.is_llm and seg.text.strip():
+                    sent_text_parts.append(seg.text)
                 delay = self._calc_delay(
                     seg.text,
                     self.cfg.per_char_delay,
@@ -378,6 +385,14 @@ class SplitStep(BaseStep):
                     await asyncio.sleep(delay)
             except Exception as e:
                 logger.error(f"[Splitter] 第{i + 1}段发送失败: {e}")
+
+        # Preserve successful earlier sends plus the final segment for history.
+        if ctx.is_llm:
+            if not segments[-1].is_empty and segments[-1].text.strip():
+                sent_text_parts.append(segments[-1].text)
+            ctx.event.set_extra(
+                "_outputpro_split_full_reply", chr(10).join(sent_text_parts)
+            )
 
         # 最后一段回填
         ctx.chain.clear()
@@ -407,7 +422,9 @@ class SplitStep(BaseStep):
     # =========================
     # 核心 split
     # =========================
-    def _select_split_points(self, tokens: list[Token], max_count: int | None = None) -> set[int]:
+    def _select_split_points(
+        self, tokens: list[Token], max_count: int | None = None
+    ) -> set[int]:
         """
         选切点（最多 max_count 段 → k = max_count-1 个切点）
         规则：
@@ -459,9 +476,7 @@ class SplitStep(BaseStep):
 
         return selected
 
-    def _split_chain(
-        self, chain: list[BaseMessageComponent]
-    ) -> list[Segment]:
+    def _split_chain(self, chain: list[BaseMessageComponent]) -> list[Segment]:
         builder = SegmentBuilder()
 
         for comp in chain:
